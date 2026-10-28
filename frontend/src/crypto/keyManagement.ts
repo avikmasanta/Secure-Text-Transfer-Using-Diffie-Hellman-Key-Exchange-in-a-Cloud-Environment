@@ -134,23 +134,34 @@ export async function saveKeysToStorage(bundle: ClientKeyBundle): Promise<void> 
     createdAt: bundle.createdAt,
   };
 
+  const json = JSON.stringify(serialized);
   try {
-    sessionStorage.setItem(`securetext_keys_${bundle.userId}`, JSON.stringify(serialized));
-    localStorage.setItem(`securetext_keys_backup_${bundle.userId}`, JSON.stringify(serialized));
+    // PRIMARY: localStorage persists across tabs, browser restarts, and session expiry
+    localStorage.setItem(`securetext_keys_${bundle.userId}`, json);
   } catch (err) {
-    console.warn('Storage save warning:', err);
+    console.warn('localStorage save warning:', err);
+  }
+  try {
+    // SECONDARY: sessionStorage as a fast in-tab cache
+    sessionStorage.setItem(`securetext_keys_${bundle.userId}`, json);
+  } catch (err) {
+    console.warn('sessionStorage save warning:', err);
   }
 }
 
 export function loadKeysFromStorage(userId: string): ClientKeyBundle | null {
   try {
+    // PRIMARY: always prefer localStorage so keys survive tab/session close
     const raw =
+      localStorage.getItem(`securetext_keys_${userId}`) ||
       sessionStorage.getItem(`securetext_keys_${userId}`) ||
+      // Legacy fallback for old backup key name
       localStorage.getItem(`securetext_keys_backup_${userId}`);
+
     if (!raw) return null;
 
     const parsed = JSON.parse(raw);
-    return {
+    const bundle: ClientKeyBundle = {
       userId: parsed.userId,
       keyId: parsed.keyId,
       version: parsed.version,
@@ -167,6 +178,12 @@ export function loadKeysFromStorage(userId: string): ClientKeyBundle | null {
       registrationSignature: parsed.registrationSignature,
       createdAt: parsed.createdAt,
     };
+
+    // Re-sync to both stores so next load is fast from either
+    try { sessionStorage.setItem(`securetext_keys_${userId}`, raw); } catch { /* ignore */ }
+    try { localStorage.setItem(`securetext_keys_${userId}`, raw); } catch { /* ignore */ }
+
+    return bundle;
   } catch (err) {
     console.error('Failed to load keys from storage:', err);
     return null;

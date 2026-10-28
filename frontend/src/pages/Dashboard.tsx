@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Search,
   Send,
@@ -21,6 +21,7 @@ import {
   apiSendMessage,
   apiGetUserKeyBundle,
   apiListDirectory,
+  apiGetKeyByKeyId,
   ConversationItem,
   StoredMessageRecord,
   DirectoryUser,
@@ -38,6 +39,7 @@ interface DecryptedChatBubble {
   isMine: boolean;
   isDecrypted: boolean;
   decryptionError?: string;
+  signatureWarning?: string;
   fingerprint: string;
 }
 
@@ -51,6 +53,9 @@ export const Dashboard: React.FC = () => {
   const [searchQuery, setSearchQuery] = useState('');
   const [newText, setNewText] = useState('');
   const [isSending, setIsSending] = useState(false);
+
+  // Cache for signing public keys looked up by keyId (avoids repeated API calls)
+  const signingKeyCache = useRef<Map<string, string>>(new Map());
 
   // Modals state
   const [inspectedMessage, setInspectedMessage] = useState<StoredMessageRecord | null>(null);
@@ -95,74 +100,110 @@ export const Dashboard: React.FC = () => {
     try {
       const res = await apiGetMessages({ participantId: activeParticipant.id });
 
+      // Pre-fetch any missing signing keys for messages in this conversation
+      // We look up by senderKeyId so we get the exact key used for signing (even revoked ones)
+      const missingKeyIds = new Set<string>();
+      for (const record of res.messages) {
+        if (record.senderId !== user?.id && !signingKeyCache.current.has(record.senderKeyId)) {
+          missingKeyIds.add(record.senderKeyId);
+        }
+      }
+
+      // Fetch unknown key bundles (batch, parallel)
+      await Promise.all(
+        Array.from(missingKeyIds).map(async (keyId) => {
+          try {
+            const { bundle } = await apiGetKeyByKeyId(keyId);
+            signingKeyCache.current.set(keyId, bundle.signingPublicKey);
+          } catch {
+            // Key not found - fall back to current participant key
+            if (activeParticipant.signingPublicKey) {
+              signingKeyCache.current.set(keyId, activeParticipant.signingPublicKey);
+            }
+          }
+        })
+      );
+
       const decryptedList: DecryptedChatBubble[] = res.messages.map((record) => {
         const isMine = record.senderId === user?.id;
 
         if (isMine) {
-          // Message sent by me: decrypt using ephemeral key stored or display notification
-          // Sender can re-decrypt by computing shared secret: X25519(ek_priv, recipient_dh_pub)
-          // For sent messages, decrypt using recipient's public key if available
-          try {
-            // Sender can verify their own envelope
-            const plaintext = '(Your encrypted message sent to cloud)';
-            return {
-              record,
-              plaintext,
-              isMine: true,
-              isDecrypted: true,
-              fingerprint: activeParticipant.fingerprint || '',
-            };
-          } catch {
-            return {
-              record,
-              plaintext: '(Sent message payload in cloud)',
-              isMine: true,
-              isDecrypted: true,
-              fingerprint: activeParticipant.fingerprint || '',
-            };
-          }
-        } else {
-          // Message received by me: Decrypt using my private X25519 identity key!
-          try {
-            const decrypted = verifyAndDecryptMessage(
-              clientKeys,
-              activeParticipant.signingPublicKey || '',
-              {
-                messageId: record.messageId,
-                senderId: record.senderId,
-                recipientId: record.recipientId,
-                protocolVersion: record.protocolVersion,
-                senderKeyId: record.senderKeyId,
-                recipientKeyId: record.recipientKeyId,
-                ephemeralPublicKey: record.ephemeralPublicKey,
-                nonce: record.nonce,
-                ciphertext: record.ciphertext,
-                authTag: record.authTag,
-                signature: record.signature,
-                canonicalAAD: record.canonicalAAD,
-                timestamp: record.timestamp,
-                deliveryStatus: record.deliveryStatus,
-              },
-              true // allow reading stored messages
-            );
+          // Sent messages: the sender encrypted for the recipient so they cannot
+          // re-derive the same shared secret without the ephemeral private key (which was zeroized).
+          // Display a clear informational placeholder instead.
+          return {
+            record,
+            plaintext: '🔒 (Your encrypted message — stored securely in cloud)',
+            isMine: true,
+            isDecrypted: true,
+            fingerprint: activeParticipant.fingerprint || '',
+          };
+        }
 
-            return {
-              record,
-              plaintext: decrypted.plaintext,
-              isMine: false,
-              isDecrypted: true,
-              fingerprint: activeParticipant.fingerprint || '',
-            };
-          } catch (decErr: any) {
-            return {
-              record,
-              plaintext: '[CRYPTOGRAPHIC INTEGRITY FAILURE: Message Tampered or Invalid Signature]',
-              isMine: false,
-              isDecrypted: false,
-              decryptionError: decErr.message,
-              fingerprint: activeParticipant.fingerprint || '',
-            };
+        // --- Received message: full cryptographic verification + decryption ---
+        try {
+          // Resolve the exact signing public key used when this message was signed
+          const signingPubKey =
+            signingKeyCache.current.get(record.senderKeyId) ||
+            activeParticipant.signingPublicKey ||
+            '';
+
+          const decrypted = verifyAndDecryptMessage(
+            clientKeys,
+            signingPubKey,
+            {
+              messageId: record.messageId,
+              senderId: record.senderId,
+              recipientId: record.recipientId,
+              protocolVersion: record.protocolVersion,
+              senderKeyId: record.senderKeyId,
+              recipientKeyId: record.recipientKeyId,
+              ephemeralPublicKey: record.ephemeralPublicKey,
+              nonce: record.nonce,
+              ciphertext: record.ciphertext,
+              authTag: record.authTag,
+              signature: record.signature,
+              canonicalAAD: record.canonicalAAD,
+              timestamp: record.timestamp,
+              deliveryStatus: record.deliveryStatus,
+            },
+            true // allow replay for stored messages
+          );
+
+          return {
+            record,
+            plaintext: decrypted.plaintext,
+            isMine: false,
+            isDecrypted: true,
+            fingerprint: activeParticipant.fingerprint || '',
+          };
+        } catch (decErr: any) {
+          const errMsg: string = decErr.message || '';
+
+          // Distinguish between a signature problem and an AES-GCM failure
+          const isSigFailure = errMsg.includes('Signature Verification Failed') ||
+                               errMsg.includes('forged, altered');
+          const isGcmFailure = errMsg.includes('ghash tag') ||
+                               errMsg.includes('authentication tag mismatch') ||
+                               errMsg.includes('tampering detected');
+
+          let displayError: string;
+          if (isSigFailure) {
+            displayError = '⚠ Sender key has changed since this message was sent. Signature cannot be verified with current key.';
+          } else if (isGcmFailure) {
+            displayError = '⚠ Decryption failed: Your private key does not match the recipient key used to encrypt this message. This may happen after key rotation or when accessing from a new device.';
+          } else {
+            displayError = `⚠ ${errMsg}`;
           }
+
+          return {
+            record,
+            plaintext: '[CRYPTOGRAPHIC INTEGRITY FAILURE: Message Tampered or Invalid Signature]',
+            isMine: false,
+            isDecrypted: false,
+            decryptionError: displayError,
+            fingerprint: activeParticipant.fingerprint || '',
+          };
         }
       });
 

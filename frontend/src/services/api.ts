@@ -83,6 +83,14 @@ export async function apiGetUserKeyBundle(userId: string) {
   return request<{ bundle: UserPublicKeyBundle }>(`/keys/${userId}`);
 }
 
+/**
+ * Fetches any key bundle (including revoked/rotated) by its keyId.
+ * Essential for verifying signatures on messages sent before a key rotation.
+ */
+export async function apiGetKeyByKeyId(keyId: string) {
+  return request<{ bundle: UserPublicKeyBundle }>(`/keys/by-key-id/${keyId}`);
+}
+
 export interface DirectoryUser {
   id: string;
   email: string;

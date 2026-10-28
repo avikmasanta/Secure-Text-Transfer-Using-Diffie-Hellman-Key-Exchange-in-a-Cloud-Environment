@@ -49,15 +49,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         const { user: profile } = await apiGetMe();
         setUser(profile);
 
-        // Load client keybundle for this user
+        // Try to load existing keys from persistent storage first
         let keys = loadKeysFromStorage(profile.id);
+
         if (!keys) {
-          // Generate initial cryptographic keys for this client session
-          console.log('[Crypto] Generating new client X25519 & Ed25519 identity key bundle...');
+          // No existing keys found anywhere — generate a fresh bundle for this device
+          console.log('[Crypto] No keys found in storage. Generating new X25519 & Ed25519 identity key bundle...');
           keys = createClientKeyBundle(profile.id, 1);
           await saveKeysToStorage(keys);
 
-          // Register public keys with server
+          // Register new public keys with server
           await apiRegisterKeys({
             keyId: keys.keyId,
             version: keys.version,
@@ -65,7 +66,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             signingPublicKey: bytesToBase64(keys.signingKeys.publicKey),
             signature: keys.registrationSignature,
           });
+          console.log('[Crypto] New keys registered with server. KeyId:', keys.keyId);
+        } else {
+          // Keys found — re-use them. Re-sync to storage to refresh TTL.
+          console.log('[Crypto] Loaded existing keys from storage. KeyId:', keys.keyId);
+          await saveKeysToStorage(keys);
         }
+
         setClientKeys(keys);
       } catch (err) {
         console.warn('Session verification failed, clearing token:', err);
@@ -87,9 +94,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setStoredToken(token);
       setUser(profile);
 
-      // Check or generate keys
+      // ALWAYS check persistent storage first — never regenerate if keys exist
       let keys = loadKeysFromStorage(profile.id);
       if (!keys) {
+        // First login on this device — generate and register fresh keys
+        console.log('[Crypto] First login on this device. Generating new key bundle...');
         keys = createClientKeyBundle(profile.id, 1);
         await saveKeysToStorage(keys);
 
@@ -100,7 +109,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           signingPublicKey: bytesToBase64(keys.signingKeys.publicKey),
           signature: keys.registrationSignature,
         });
+        console.log('[Crypto] Keys registered with server. KeyId:', keys.keyId);
+      } else {
+        // Returning login — reuse existing keys so old messages remain decryptable
+        console.log('[Crypto] Reusing existing keys from storage. KeyId:', keys.keyId);
+        await saveKeysToStorage(keys); // re-sync storage
       }
+
       setClientKeys(keys);
     } finally {
       setIsLoading(false);

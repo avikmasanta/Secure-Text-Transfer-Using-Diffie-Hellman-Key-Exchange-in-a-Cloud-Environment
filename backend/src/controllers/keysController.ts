@@ -8,6 +8,7 @@ import {
   computeSafetyNumber,
   base64ToBytes,
 } from '../crypto/verifyKeyBundle.js';
+import { Request } from 'express';
 
 const registerKeysSchema = z.object({
   keyId: z.string().min(1),
@@ -263,5 +264,53 @@ export async function rotateKeys(req: AuthenticatedRequest, res: Response) {
   } catch (err: any) {
     console.error('Key rotation error:', err);
     res.status(500).json({ error: 'Internal server error during key rotation' });
+  }
+}
+
+/**
+ * GET /api/keys/by-key-id/:keyId
+ * Fetches any key bundle (including revoked) by its keyId.
+ * Used by recipients to verify historical message signatures after sender key rotation.
+ */
+export async function getKeyByKeyId(req: Request, res: Response) {
+  try {
+    const { keyId } = req.params;
+    const db = await getDatabase();
+
+    const rows = await db.query(
+      `SELECT k.id, k.user_id, k.key_id, k.version, k.dh_public_key, k.signing_public_key,
+              k.signature, k.fingerprint, k.safety_number, k.is_revoked, k.created_at,
+              u.email, u.full_name
+       FROM user_public_keys k
+       JOIN users u ON u.id = k.user_id
+       WHERE k.key_id = ?
+       LIMIT 1`,
+      [keyId]
+    );
+
+    if (rows.length === 0) {
+      res.status(404).json({ error: 'Key bundle not found for the given keyId' });
+      return;
+    }
+
+    const row = rows[0];
+    res.json({
+      bundle: {
+        userId: row.user_id,
+        userEmail: row.email,
+        userFullName: row.full_name,
+        keyId: row.key_id,
+        version: row.version,
+        dhPublicKey: row.dh_public_key,
+        signingPublicKey: row.signing_public_key,
+        fingerprint: row.fingerprint,
+        safetyNumber: row.safety_number,
+        isRevoked: Boolean(row.is_revoked),
+        createdAt: row.created_at,
+      },
+    });
+  } catch (err: any) {
+    console.error('Get key by keyId error:', err);
+    res.status(500).json({ error: 'Internal server error fetching key bundle by keyId' });
   }
 }
